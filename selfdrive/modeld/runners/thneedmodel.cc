@@ -6,7 +6,7 @@
 #include <fstream>
 #include <random>
 #include <string>
-
+#include <cstring> // For std::memcpy
 #include <filesystem>
 
 int accumulateDatas = 100; // 100 frames
@@ -15,27 +15,39 @@ int collectData = 1; // 1:true, 0:false
 int readyToSave = 1; // 1:true, 0:false
 long finishStamp = 0; 
 
-const std::string LOGROOT = "/home/openpilot_log";
+const std::string LOGROOT = "/data/openpilot_log";
 namespace fst = std::filesystem;
 
 std::string SESSION;
 std::string FOLDER;
 
-const size_t FileSize = 4 * 1 * 12 * 128 * 256;
-std::shared_ptr<std::vector<char>> BUFFER = std::make_shared<std::vector<char>>(FileSize * accumulateDatas); // Create buffer [accumulateDatas] * file size larger
+size_t DESIRE_SIZE;
+size_t TRAFFIC_SIZE;
+size_t FEATURE_SIZE;
+size_t OUTPUT_SIZE;
+size_t FILE_SIZE;
+size_t ImgSize;
+
+std::shared_ptr<std::vector<char>> IMGBUFFER;
+std::shared_ptr<std::vector<char>> FILEBUFFER;
 
 struct CallbackData {
-    std::shared_ptr<std::vector<char>> buffer;
+    std::shared_ptr<std::vector<char>> img_buffer;
+    std::shared_ptr<std::vector<char>> file_buffer;
     size_t file_size;
     size_t files_written;
     int max_files;
 
-    CallbackData(std::shared_ptr<std::vector<char>> buf, size_t size, size_t written, int max)
-    : buffer(buf), file_size(size), files_written(written), max_files(max)
+    CallbackData(std::shared_ptr<std::vector<char>> i_buf,
+		    std::shared_ptr<std::vector<char>> f_buf, 
+		    size_t size, 
+		    size_t written, 
+		    int max)
+    : img_buffer(i_buf), file_buffer(f_buf), file_size(size), files_written(written), max_files(max)
     {}
 };
 
-CallbackData* IMG_DATA = new CallbackData{BUFFER, FileSize, 0, accumulateDatas};
+CallbackData* DATA;
 
 int read_config(const std::string &filename) {
     //std::filesystem::path current_path = std::filesystem::current_path();
@@ -65,27 +77,22 @@ int read_config(const std::string &filename) {
     }
 }
 
-void save_array_to_file(std::string file_path, const float* array_obj, const int array_obj_size) {
-  std::ofstream output_file(file_path, std::ios::binary);
-  output_file.write(reinterpret_cast<const char*>(array_obj), array_obj_size * sizeof(float));
-  output_file.close();
+
+size_t save_to_buffer(const float* src, size_t current_offset, size_t file_size) {
+
+    size_t offset = DATA->files_written * FILE_SIZE + current_offset;
+    // Convert float* to char* for copying
+    const char* src_char = reinterpret_cast<const char*>(src);
+    std::memcpy(DATA->file_buffer->data() + offset, src_char, file_size);
+    return current_offset + file_size;
 }
-
-bool copy_clmem_to_buffer(const cl_mem cl_mem_obj, size_t file_size,cl_command_queue command_queue) {
-    cl_int err;
-    auto buffer = std::make_shared<std::vector<char>>(file_size);
-    err = clEnqueueReadBuffer(command_queue, cl_mem_obj, CL_TRUE, 0, file_size, buffer->data(), 0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        std::cerr << "Error: Failed to read cl_mem_obj (" << err << ")" << std::endl;
-        return false;
-    }
-
-    return true;
-}
-
 
 void CL_CALLBACK write_complete_callback(cl_event event, cl_int status, void *user_data) {
     cl_int err;
+    
+    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    SESSION = std::to_string(ms);
+    FOLDER = LOGROOT + "/" + SESSION;
     
     readyToSave = 0;
     fst::create_directory(FOLDER);
@@ -95,18 +102,27 @@ void CL_CALLBACK write_complete_callback(cl_event event, cl_int status, void *us
         return;
     }
     auto data = static_cast<CallbackData*>(user_data);
-    auto buffer = data->buffer;
-    const std::string& file_path = FOLDER + "/img_inputs.bin";
+    auto img_buffer = data->img_buffer;
+    auto file_buffer = data->file_buffer;
 
+    const std::string& img_path = FOLDER + "/img_inputs.bin";
+    std::ofstream output_img(img_path, std::ios::binary);
+    if (!output_img.is_open()) {
+        std::cerr << "Error: Failed to open file \"" << img_path << "\"" << std::endl;
+        return;
+    }
+    output_img.write(img_buffer->data(), img_buffer->size());
+    output_img.close();
+
+    const std::string& file_path = FOLDER + "/files.bin";
     std::ofstream output_file(file_path, std::ios::binary);
     if (!output_file.is_open()) {
         std::cerr << "Error: Failed to open file \"" << file_path << "\"" << std::endl;
         return;
     }
-
-    output_file.write(buffer->data(), buffer->size());
+    output_file.write(file_buffer->data(), file_buffer->size());
     output_file.close();
-    
+
     // Release event object
     err = clReleaseEvent(event);
     if (err != CL_SUCCESS) {
@@ -119,27 +135,33 @@ void CL_CALLBACK write_complete_callback(cl_event event, cl_int status, void *us
 }
 
 
-bool save_clmem_to_file(const cl_mem cl_mem_obj, cl_context context, cl_command_queue command_queue) {
+bool save_clmem_to_file(const cl_mem cl_mem_obj, cl_context context, cl_command_queue command_queue, bool finish_this_cycle) {
     cl_int err;
 
+    size_t offset;
     // Write to the next section of the buffer
-    size_t offset = IMG_DATA->files_written * FileSize;
-
+    if (finish_this_cycle) {
+    offset = DATA->files_written * 2 * ImgSize + ImgSize;
+    }else{
+    offset = DATA->files_written * 2 * ImgSize;
+    }
+    //std::cerr << "offset : " << offset << std::endl;
+    
     // Read cl_mem_obj into buffer
     cl_event read_event;
-    //err = clEnqueueReadBuffer(command_queue, cl_mem_obj, CL_FALSE, offset, FileSize, IMG_DATA->buffer->data() + offset, 0, nullptr, &read_event);
-    err = clEnqueueReadBuffer(command_queue, cl_mem_obj, CL_FALSE, 0, FileSize, reinterpret_cast<void*>(IMG_DATA->buffer->data() + offset), 0, nullptr, &read_event);
+    //err = clEnqueueReadBuffer(command_queue, cl_mem_obj, CL_FALSE, offset, ImgSize, DATA->buffer->data() + offset, 0, nullptr, &read_event);
+    err = clEnqueueReadBuffer(command_queue, cl_mem_obj, CL_FALSE, 0, ImgSize, reinterpret_cast<void*>(DATA->img_buffer->data() + offset), 0, nullptr, &read_event);
 
     if (err != CL_SUCCESS) {
         std::cerr << "Error: Failed to read cl_mem_obj (" << err << ")" << std::endl;
         return false;
     }
-
-    IMG_DATA->files_written++;
-
+    if (finish_this_cycle){
+    DATA->files_written++;
+    }
     // Set callback function to write to file after buffer is full
-    if (IMG_DATA->files_written >= IMG_DATA->max_files and readyToSave == 1) {
-        err = clSetEventCallback(read_event, CL_COMPLETE, &write_complete_callback, IMG_DATA);
+    if (DATA->files_written >= DATA->max_files and readyToSave == 1) {
+        err = clSetEventCallback(read_event, CL_COMPLETE, &write_complete_callback, DATA);
         if (err != CL_SUCCESS) {
             std::cerr << "Error: Failed to set callback for read event (" << err << ")" << std::endl;
             return false;
@@ -164,6 +186,26 @@ ThneedModel::ThneedModel(const char *path, float *loutput, size_t loutput_size, 
   thneed->load(path);
   thneed->clexec();
 
+  ImgSize = thneed->input_sizes[3]; 
+  FEATURE_SIZE = thneed->input_sizes[0];
+  TRAFFIC_SIZE = thneed->input_sizes[1];
+  DESIRE_SIZE = thneed->input_sizes[2];
+  clGetMemObjectInfo(thneed->output, CL_MEM_SIZE, sizeof(OUTPUT_SIZE), &OUTPUT_SIZE, NULL);
+  FILE_SIZE = FEATURE_SIZE + TRAFFIC_SIZE + DESIRE_SIZE + OUTPUT_SIZE;
+
+  std::cerr << "FEATURE_SIZE : " << FEATURE_SIZE << std::endl;
+  std::cerr << "TRAFFIC_SIZE : " << TRAFFIC_SIZE << std::endl;
+  std::cerr << "DESIRE_SIZE : " << DESIRE_SIZE << std::endl;
+  std::cerr << "OUTPUT_SIZE : " << OUTPUT_SIZE << std::endl;
+  std::cerr << "FILE_SIZE : " << FILE_SIZE << std::endl;
+  if (luse_extra){
+  IMGBUFFER = std::make_shared<std::vector<char>>(ImgSize * accumulateDatas * 2);
+  } else{
+  IMGBUFFER = std::make_shared<std::vector<char>>(ImgSize * accumulateDatas);
+  }
+  FILEBUFFER = std::make_shared<std::vector<char>>(FILE_SIZE * accumulateDatas);
+  DATA = new CallbackData{IMGBUFFER, FILEBUFFER, ImgSize, 0, accumulateDatas};
+  
   recorded = false;
   output = loutput;
   use_extra = luse_extra;
@@ -210,8 +252,6 @@ void* ThneedModel::getExtraBuf() {
 
 void ThneedModel::execute() {
   long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-  SESSION = std::to_string(ms);
-  FOLDER = LOGROOT + "/" + SESSION;
 
   if (!recorded) {
     thneed->record = true;
@@ -233,10 +273,15 @@ void ThneedModel::execute() {
 
       float *inputs[5] = {recurrent, trafficConvention, desire, extra, input};
       thneed->execute(inputs, output);
-
-      std::cerr << " ms - finishStamp: " << ms-finishStamp << ", ready to save : " << readyToSave << std::endl;
+      size_t current_offset;
+      //std::cerr << " ms - finishStamp: " << ms-finishStamp << ", ready to save : " << readyToSave << std::endl;
       if (collectData == 1 and (ms - finishStamp) > waitRecovery * 1000 and readyToSave == 1) {
-        save_clmem_to_file(thneed->input_clmem[3], thneed->context, thneed->command_queue);
+        current_offset = save_to_buffer(recurrent, 0, FEATURE_SIZE);
+        current_offset = save_to_buffer(trafficConvention, current_offset, TRAFFIC_SIZE);
+        current_offset = save_to_buffer(desire, current_offset, DESIRE_SIZE);
+        current_offset = save_to_buffer(output, current_offset, OUTPUT_SIZE);
+      	save_clmem_to_file(thneed->input_clmem[3], thneed->context, thneed->command_queue, false);
+        save_clmem_to_file(thneed->input_clmem[4], thneed->context, thneed->command_queue, true);
       }
 
     } else {
